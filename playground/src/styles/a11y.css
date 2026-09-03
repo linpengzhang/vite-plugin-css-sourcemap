@@ -1,0 +1,10 @@
+.skip-link {
+  left: -999px;
+}
+
+/* Duplicated verbatim from print.css, which makes that stylesheet's compiled
+   CSS a substring of this one's. */
+.visually-hidden {
+  position: absolute;
+  clip: rect(0 0 0 0);
+}

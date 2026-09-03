@@ -18,6 +18,11 @@ import './styles/components/modal.css';
 // Utility styles
 import './styles/utilities.css';
 import './styles/animations.css';
+import './styles/a11y.css';
+import './styles/print.css';
+
+// Styles that reference an emitted asset
+import './styles/hero.css';
 
 // Original styles
 import './styles/main.css';

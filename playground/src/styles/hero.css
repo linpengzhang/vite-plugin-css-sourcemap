@@ -1,0 +1,11 @@
+/* Referencing an asset means this stylesheet still holds a Vite placeholder
+   when the plugin captures it, and the real URL is substituted afterwards. */
+.hero {
+  background-image: url('../assets/dot.svg');
+  padding: 2rem;
+}
+
+.hero-caption {
+  font-size: 0.875rem;
+  color: #666;
+}

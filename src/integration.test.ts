@@ -515,4 +515,88 @@ describe('vite-plugin-css-sourcemap position resolution', () => {
     expect(resolved.size).toBeGreaterThan(1);
     expect(resolved.size).toBe(map.sources.length);
   });
+
+  // A `url()` is still an unresolved placeholder when the plugin captures the
+  // stylesheet, and `vite:css-post` substitutes the hashed URL afterwards, so
+  // looking for the captured text verbatim never finds it. Without allowing
+  // for that, every rule in a stylesheet using a font or an image is dropped.
+  it('should map stylesheets that reference an emitted asset', async () => {
+    await build({
+      root: playgroundDir,
+      // Emit the asset as a file rather than inlining it, which is what
+      // happens to any real font or image over Vite's inlining threshold.
+      build: { outDir: 'dist', assetsInlineLimit: 0 },
+      configFile: false,
+      logLevel: 'error',
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+    const cssFile = files.find((file) => file.endsWith('.css'))!;
+    const css = await readFile(resolve(assetsDir, cssFile), 'utf-8');
+    const map = JSON.parse(
+      await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+    );
+
+    expect(css).toContain('url(');
+    expect(css).not.toContain('__VITE_ASSET__');
+    expect(
+      map.sources.some((source: string) => source.includes('hero.css')),
+    ).toBe(true);
+
+    const tracer = new TraceMap(map);
+    const lines = css.split('\n');
+    const line = lines.findIndex((text) => text.includes('.hero-caption'));
+    expect(line, 'no .hero-caption rule in the built CSS').toBeGreaterThan(-1);
+
+    expect(
+      originalPositionFor(tracer, {
+        line: line + 1,
+        column: lines[line]!.indexOf('.hero-caption'),
+      }).source,
+    ).toContain('hero.css');
+  });
+
+  // Claiming a start offset rather than a whole region lets a stylesheet whose
+  // CSS is contained in another's take a position inside it, so the containing
+  // stylesheet either goes missing or inherits the shorter one's coverage.
+  it('should keep stylesheets apart when one contains the other', async () => {
+    await build({
+      root: playgroundDir,
+      build: { outDir: 'dist' },
+      configFile: false,
+      logLevel: 'error',
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+    const cssFile = files.find((file) => file.endsWith('.css'))!;
+    const css = await readFile(resolve(assetsDir, cssFile), 'utf-8');
+    const map = JSON.parse(
+      await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+    );
+
+    const tracer = new TraceMap(map);
+    const resolved = new Set<string>();
+    for (let line = 1; line <= css.split('\n').length; line++) {
+      const { source } = originalPositionFor(tracer, { line, column: 0 });
+      if (source) resolved.add(source);
+    }
+
+    for (const stylesheet of ['a11y.css', 'print.css']) {
+      expect(
+        [...resolved].some((source) => source.includes(stylesheet)),
+        `${stylesheet} is unreachable through the sourcemap`,
+      ).toBe(true);
+    }
+
+    const lines = css.split('\n');
+    const line = lines.findIndex((text) => text.includes('.skip-link'));
+    expect(
+      originalPositionFor(tracer, {
+        line: line + 1,
+        column: lines[line]!.indexOf('.skip-link'),
+      }).source,
+    ).toContain('a11y.css');
+  });
 });

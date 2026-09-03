@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { Plugin } from 'vite';
 import { decode, encode } from '@jridgewell/sourcemap-codec';
 import type {
@@ -58,6 +59,8 @@ interface ConcatenatedSourceMap {
 
 /** A stylesheet as it appeared once Vite finished compiling it. */
 interface CompiledStylesheet {
+  /** The file the stylesheet lives in, without Vite's module query. */
+  sourcePath: string;
   code: string;
   map: ExistingRawSourceMap | null;
 }
@@ -69,6 +72,15 @@ interface PlacedStylesheet {
   line: number;
   column: number;
 }
+
+/** A region of the concatenated asset that one stylesheet occupies. */
+interface AssetRegion {
+  start: number;
+  end: number;
+}
+
+/** Stand-in Vite leaves in CSS for an asset whose final URL isn't known yet. */
+const ASSET_PLACEHOLDER = /__VITE(?:_PUBLIC)?_ASSET__[\w$]+__/g;
 
 export default function cssSourcemapPlugin(
   options: CssSourcemapOptions = {},
@@ -169,7 +181,11 @@ export default function cssSourcemapPlugin(
         map = await compileSCSS(id);
       }
 
+      // A single-file component hands over its styles under an id whose
+      // extension sits in the query, e.g. `App.vue?vue&type=style&lang.css`,
+      // so the path has to be recovered separately for `sources`.
       compiled.set(id, {
+        sourcePath: id.split('?')[0] ?? id,
         code,
         map: isEmptySourcemap(map) ? null : map,
       });
@@ -224,22 +240,28 @@ function locateStylesheets(
   compiled: Map<string, CompiledStylesheet>,
 ): PlacedStylesheet[] {
   const placed: PlacedStylesheet[] = [];
-  const claimed = new Set<number>();
+  const claimed: AssetRegion[] = [];
 
-  for (const [id, stylesheet] of compiled) {
-    const offset = findUnclaimedOffset(css, stylesheet.code.trim(), claimed);
-    if (offset === -1) continue;
-    claimed.add(offset);
+  // Longest first, so that a stylesheet whose CSS contains another's claims its
+  // full region before the shorter one can take a position inside it.
+  const byLengthDescending = [...compiled.entries()].sort(
+    ([, a], [, b]) => b.code.trim().length - a.code.trim().length,
+  );
 
-    const preceding = css.slice(0, offset);
+  for (const [, stylesheet] of byLengthDescending) {
+    const region = findUnclaimedRegion(css, stylesheet.code.trim(), claimed);
+    if (!region) continue;
+    claimed.push(region);
+
+    const preceding = css.slice(0, region.start);
     placed.push({
-      id,
+      id: stylesheet.sourcePath,
       stylesheet,
       line: preceding.split('\n').length - 1,
       // Vite can concatenate one stylesheet's last line and the next
       // stylesheet's first onto a single physical line, so the offset within
       // that line is what keeps their mappings apart.
-      column: offset - (preceding.lastIndexOf('\n') + 1),
+      column: region.start - (preceding.lastIndexOf('\n') + 1),
     });
   }
 
@@ -247,20 +269,75 @@ function locateStylesheets(
 }
 
 /**
- * Finds an occurrence of `needle` that no other stylesheet has taken. Two
- * stylesheets can compile to byte-identical CSS, and without this they would
- * both claim the first occurrence, leaving one unreachable in the map.
+ * Finds the region of the asset a stylesheet occupies, ignoring regions another
+ * stylesheet already occupies.
+ *
+ * Claiming whole regions rather than start offsets matters in both directions:
+ * two stylesheets can compile to byte-identical CSS, and one stylesheet's CSS
+ * can be contained in another's. Either way the loser would otherwise be
+ * unreachable through the map, with its coverage attributed to the winner.
  */
-function findUnclaimedOffset(
+function findUnclaimedRegion(
   css: string,
   needle: string,
-  claimed: ReadonlySet<number>,
-): number {
-  let offset = css.indexOf(needle);
-  while (offset !== -1 && claimed.has(offset)) {
-    offset = css.indexOf(needle, offset + 1);
+  claimed: readonly AssetRegion[],
+): AssetRegion | null {
+  const pattern = buildNeedlePattern(needle);
+
+  if (!pattern) {
+    let start = css.indexOf(needle);
+    while (start !== -1) {
+      const region = { start, end: start + needle.length };
+      if (!overlapsClaimed(region, claimed)) return region;
+      start = css.indexOf(needle, start + 1);
+    }
+    return null;
   }
-  return offset;
+
+  let match = pattern.exec(css);
+  while (match) {
+    const region = { start: match.index, end: match.index + match[0].length };
+    if (!overlapsClaimed(region, claimed)) return region;
+    pattern.lastIndex = match.index + 1;
+    match = pattern.exec(css);
+  }
+  return null;
+}
+
+/**
+ * Builds a pattern for a stylesheet whose CSS still contains asset
+ * placeholders, or returns null when a plain substring search will do.
+ *
+ * A `url()` reference is still a placeholder at the point this plugin captures
+ * the stylesheet, and `vite:css-post` substitutes the real hashed URL
+ * afterwards. Searching for the captured text verbatim would therefore never
+ * find a stylesheet that references an image or font.
+ */
+function buildNeedlePattern(needle: string): RegExp | null {
+  ASSET_PLACEHOLDER.lastIndex = 0;
+  if (!ASSET_PLACEHOLDER.test(needle)) return null;
+
+  const source = needle
+    .split(ASSET_PLACEHOLDER)
+    .map(escapeForRegExp)
+    // A substituted URL never contains a quote, a closing paren, or a newline,
+    // so this cannot run past the end of the `url()` it belongs to.
+    .join(`[^"')\\n]*`);
+
+  return new RegExp(source, 'g');
+}
+
+function escapeForRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function overlapsClaimed(
+  region: AssetRegion,
+  claimed: readonly AssetRegion[],
+): boolean {
+  return claimed.some(
+    (other) => region.start < other.end && other.start < region.end,
+  );
 }
 
 /**
@@ -349,12 +426,16 @@ function buildConcatenatedSourcemap(
 }
 
 function resolveSource(id: string, source: string): string {
-  if (path.isAbsolute(source)) return source;
-  try {
-    if (source.startsWith('file://')) return new URL(source).pathname;
-  } catch {
-    // Not a URL; treat it as a relative path below.
+  if (source.startsWith('file://')) {
+    try {
+      // Not `URL.pathname`, which leaves a Windows path as `/C:/...` and keeps
+      // any percent-encoding.
+      return fileURLToPath(source);
+    } catch {
+      // Not a well-formed file URL; treat it as a path below.
+    }
   }
+  if (path.isAbsolute(source)) return source;
   return path.resolve(path.dirname(id), source);
 }
 
