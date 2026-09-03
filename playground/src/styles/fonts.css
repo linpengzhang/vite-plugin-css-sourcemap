@@ -1,4 +1,4 @@
-@import url('https://fonts.example/css2?family=Inter');
+@import url('https://fonts.example/css2?family=Inter:wght@400;700');
 
 .font-body {
   font-family: Inter, sans-serif;

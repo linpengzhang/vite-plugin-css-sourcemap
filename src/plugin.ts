@@ -356,9 +356,11 @@ function stripHoistedAtRules(
   let found = false;
 
   for (;;) {
-    const match = /^\s*@(?:charset|import)\b[^;]*;/.exec(rest);
-    if (!match) break;
-    rest = rest.slice(match[0].length);
+    const trimmed = rest.trimStart();
+    if (!/^@(?:charset|import)\b/.test(trimmed)) break;
+    const end = endOfStatement(trimmed);
+    if (end === -1) break;
+    rest = trimmed.slice(end);
     found = true;
   }
 
@@ -370,6 +372,38 @@ function stripHoistedAtRules(
     text,
     skippedLines: code.slice(0, consumed).split('\n').length - 1,
   };
+}
+
+/**
+ * Offset just past the `;` that ends an at-rule statement, or -1 if it has no
+ * such terminator.
+ *
+ * Scanning rather than searching for the first `;` because a URL can contain
+ * one — `family=Inter:wght@400;700` is how Google Fonts asks for two weights,
+ * and a data URI can hold any number of them.
+ */
+function endOfStatement(code: string): number {
+  let quote: string | null = null;
+  let depth = 0;
+
+  for (let i = 0; i < code.length; i++) {
+    const char = code[i];
+
+    if (quote) {
+      if (char === '\\') i++;
+      else if (char === quote) quote = null;
+      continue;
+    }
+
+    if (char === '"' || char === "'") quote = char;
+    else if (char === '(') depth++;
+    else if (char === ')') depth--;
+    // A block at-rule such as `@media`, which Vite leaves where it is.
+    else if (char === '{') return -1;
+    else if (char === ';' && depth === 0) return i + 1;
+  }
+
+  return -1;
 }
 
 /**
