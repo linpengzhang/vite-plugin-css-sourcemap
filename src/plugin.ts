@@ -224,10 +224,12 @@ function locateStylesheets(
   compiled: Map<string, CompiledStylesheet>,
 ): PlacedStylesheet[] {
   const placed: PlacedStylesheet[] = [];
+  const claimed = new Set<number>();
 
   for (const [id, stylesheet] of compiled) {
-    const offset = css.indexOf(stylesheet.code.trim());
+    const offset = findUnclaimedOffset(css, stylesheet.code.trim(), claimed);
     if (offset === -1) continue;
+    claimed.add(offset);
 
     const preceding = css.slice(0, offset);
     placed.push({
@@ -242,6 +244,23 @@ function locateStylesheets(
   }
 
   return placed.sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+/**
+ * Finds an occurrence of `needle` that no other stylesheet has taken. Two
+ * stylesheets can compile to byte-identical CSS, and without this they would
+ * both claim the first occurrence, leaving one unreachable in the map.
+ */
+function findUnclaimedOffset(
+  css: string,
+  needle: string,
+  claimed: ReadonlySet<number>,
+): number {
+  let offset = css.indexOf(needle);
+  while (offset !== -1 && claimed.has(offset)) {
+    offset = css.indexOf(needle, offset + 1);
+  }
+  return offset;
 }
 
 /**
