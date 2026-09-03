@@ -52,75 +52,105 @@ describe('vite-plugin-css-sourcemap', () => {
     expect(hasValidExtension('/path/to/file.less')).toBe(false);
   });
 
-  it('should handle custom sourcemap URL function', () => {
-    const customPrefix = '/custom-sourcemaps/';
-    const getURL = (fileName: string) => `${customPrefix}${fileName}`;
+  it('should disable CSS minification by default', () => {
+    const plugin = cssSourcemap();
 
-    const plugin = cssSourcemap({ getURL });
+    const config = callConfig(plugin);
 
-    const mockContext = {
-      getCombinedSourcemap: () => ({ toString: () => '{}' }),
-      emitFile: vi.fn().mockReturnValue('referenceId'),
-    };
-
-    const cssFile = '/path/to/styles.css';
-    if (plugin.transform && typeof plugin.transform === 'function') {
-      plugin.transform.call(
-        mockContext as any,
-        'body { color: red; }',
-        cssFile,
-      );
-
-      expect(mockContext.emitFile).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: expect.stringContaining('.map'),
-        }),
-      );
-    }
+    expect(config).toEqual({ build: { cssMinify: false } });
   });
 
-  // TODO: Fix this test
-  it.skip('should handle custom folder option', () => {
+  it('should leave CSS minification alone when opted out', () => {
+    const plugin = cssSourcemap({ disableCssMinify: false });
+
+    expect(callConfig(plugin)).toBeUndefined();
+  });
+
+  it('should handle custom sourcemap URL function', async () => {
+    const customPrefix = '/custom-sourcemaps/';
+    const plugin = cssSourcemap({
+      getURL: (fileName: string) => `${customPrefix}${fileName}`,
+    });
+
+    const asset = await runPluginOverSingleStylesheet(plugin);
+
+    expect(asset.source).toContain(
+      `/*# sourceMappingURL=${customPrefix}styles.css.map */`,
+    );
+  });
+
+  it('should handle custom folder option', async () => {
     const customFolder = 'custom-sourcemaps';
     const plugin = cssSourcemap({ folder: customFolder });
-    const mockBundle = {
-      'styles.css': {
-        type: 'asset',
-        fileName: 'styles.css',
-        source: 'body { color: red; }',
-        name: 'styles.css',
-        needsCodeReference: false,
-        names: [],
-        originalFileName: 'styles.css',
-        originalFileNames: ['styles.css'],
-      } as OutputAsset,
-    };
-    const mockMap = {
-      finalSourceMap: {
-        version: 3,
-        sources: [
-          'vite-plugin-css-sourcemap/playground/src/styles/main.css',
-          'vite-plugin-css-sourcemap/playground/src/styles/second.css',
-        ],
-        names: [],
-        mappings: 'AAAA,CAAC,CAAC',
-        sourcesContent: ['body { color: red; }'],
-      },
-    };
-    const emitFile = vi.fn().mockReturnValue('referenceId');
 
-    const mockContext = {
-      emitFile,
-    } as unknown as PluginContext;
+    const { emitFile } = await runPluginOverSingleStylesheet(plugin);
 
-    if (plugin.generateBundle && typeof plugin.generateBundle === 'function') {
-      plugin.generateBundle.call(mockContext, {} as any, mockBundle, false);
+    expect(emitFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fileName: expect.stringContaining(`${customFolder}/`),
+      }),
+    );
+  });
 
-      expect(emitFile).toHaveBeenCalledWith(
-        expect.objectContaining({
-          fileName: expect.stringContaining(`${customFolder}/`),
-        }),
-      );
-    }
+  it('should map a position back to the stylesheet it came from', async () => {
+    const plugin = cssSourcemap();
+
+    const { emitFile } = await runPluginOverSingleStylesheet(plugin);
+    const map = JSON.parse(emitFile.mock.calls[0]![0].source);
+
+    expect(map.sources).toEqual([CSS_FILE]);
+    expect(map.mappings).not.toBe('');
   });
 });
+
+const CSS_FILE = '/path/to/styles.css';
+const CSS_SOURCE = 'body {\n  color: red;\n}';
+
+function callConfig(plugin: ReturnType<typeof cssSourcemap>) {
+  const config = plugin.config;
+  if (typeof config !== 'function') throw new Error('expected a config hook');
+  return config.call({} as any, {} as any, {} as any);
+}
+
+/**
+ * Drives the plugin the way Vite does: transform each stylesheet, then hand
+ * generateBundle the concatenated asset those stylesheets produced.
+ */
+async function runPluginOverSingleStylesheet(
+  plugin: ReturnType<typeof cssSourcemap>,
+) {
+  const emitFile = vi.fn().mockReturnValue('referenceId');
+  const context = {
+    emitFile,
+    warn: vi.fn(),
+    getCombinedSourcemap: () => ({ mappings: '', sources: [] }),
+  } as unknown as PluginContext;
+
+  const transform = plugin.transform;
+  if (typeof transform !== 'function') throw new Error('expected a transform');
+  await transform.call(context as any, CSS_SOURCE, CSS_FILE);
+
+  const asset = {
+    type: 'asset',
+    fileName: 'styles.css',
+    source: CSS_SOURCE,
+    name: 'styles.css',
+    needsCodeReference: false,
+    names: [],
+    originalFileName: 'styles.css',
+    originalFileNames: [],
+  } as unknown as OutputAsset;
+
+  const generateBundle = plugin.generateBundle;
+  if (typeof generateBundle !== 'object' || !generateBundle?.handler) {
+    throw new Error('expected a generateBundle hook');
+  }
+  await generateBundle.handler.call(
+    context,
+    {} as any,
+    { 'styles.css': asset },
+    false,
+  );
+
+  return Object.assign(asset, { emitFile });
+}

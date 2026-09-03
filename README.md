@@ -12,7 +12,7 @@ A Vite plugin for handling CSS sourcemaps. This plugin ensures that CSS sourcema
 - Supports custom sourcemap file locations
 - Configurable sourcemap URL generation
 - Works with Vite's build process
-- Compatible with Vite 5.x and 6.x
+- Compatible with Vite 5.x through 8.x
 
 ## Installation
 
@@ -55,17 +55,22 @@ cssSourcemap({
 
   // Custom function to generate sourcemap URLs
   getURL: (fileName) => `sourcemaps/${fileName}`,
+
+  // Keep Vite's CSS minification on (default: false, i.e. minification is
+  // disabled while the plugin is active)
+  disableCssMinify: true,
 });
 ```
 
 ### Options
 
-| Option       | Type                           | Default                  | Description                                |
-| ------------ | ------------------------------ | ------------------------ | ------------------------------------------ |
-| `enabled`    | `boolean`                      | `true`                   | Enable or disable the plugin               |
-| `extensions` | `string[]`                     | `['.css', '.scss']`      | File extensions to process                 |
-| `folder`     | `string`                       | `''`                     | Custom folder for sourcemap files          |
-| `getURL`     | `(fileName: string) => string` | `(fileName) => fileName` | Custom function to generate sourcemap URLs |
+| Option             | Type                           | Default                  | Description                                                |
+| ------------------ | ------------------------------ | ------------------------ | ---------------------------------------------------------- |
+| `enabled`          | `boolean`                      | `true`                   | Enable or disable the plugin                               |
+| `extensions`       | `string[]`                     | `['.css', '.scss']`      | File extensions to process                                 |
+| `folder`           | `string`                       | `''`                     | Custom folder for sourcemap files                          |
+| `getURL`           | `(fileName: string) => string` | `(fileName) => fileName` | Custom function to generate sourcemap URLs                 |
+| `disableCssMinify` | `boolean`                      | `true`                   | Disable Vite's CSS minification while the plugin is active |
 
 ## Examples
 
@@ -140,10 +145,23 @@ This plugin hooks into Vite's build process to:
 
 The plugin works by:
 
-1. Using the `transform` hook to process CSS files and generate sourcemaps
-2. Using the `generateBundle` hook to ensure sourcemaps are properly emitted
-3. It observes `vite:css-post` plugin, specifically the `augmentChunkHash` hook to obtain the future id of the file.
+1. Using the `transform` hook to capture each stylesheet after Vite has
+   compiled it, along with whatever sourcemap the preprocessor produced
+2. Using the `generateBundle` hook, ordered after `vite:css-post`, to find
+   where each stylesheet was placed inside the concatenated CSS asset
+3. Translating each stylesheet's mappings into the asset's coordinate space and
+   emitting the combined sourcemap alongside it
 4. Allows configuring the sourcemap URL based on the provided options
+
+### Why CSS minification is disabled
+
+Vite minifies a CSS asset after this plugin has recorded where each stylesheet
+landed inside it. Minifying collapses the asset onto a handful of lines, which
+invalidates those positions and produces a sourcemap that resolves every
+position back to the first source.
+
+The plugin therefore turns CSS minification off by default. If you would rather
+keep it on and forgo accurate sourcemaps, set `disableCssMinify: false`.
 
 ## Compatibility
 
@@ -151,6 +169,8 @@ This plugin is compatible with:
 
 - Vite 5.x
 - Vite 6.x
+- Vite 7.x
+- Vite 8.x (including the Rolldown-based build)
 
 ## License
 

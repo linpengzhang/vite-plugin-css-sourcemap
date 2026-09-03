@@ -3,6 +3,7 @@ import { build } from 'vite';
 import { resolve } from 'path';
 import { readFile, readdir } from 'fs/promises';
 import { rimraf } from 'rimraf';
+import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping';
 
 describe('vite-plugin-css-sourcemap integration', () => {
   const playgroundDir = resolve(__dirname, '../playground');
@@ -420,5 +421,98 @@ describe('vite-plugin-css-sourcemap SCSS entrypoint integration', () => {
 
   afterAll(async () => {
     await rimraf(distDir);
+  });
+});
+
+describe('vite-plugin-css-sourcemap position resolution', () => {
+  const playgroundDir = resolve(__dirname, '../playground');
+  const distDir = resolve(playgroundDir, 'dist');
+  const assetsDir = resolve(distDir, 'assets');
+
+  beforeEach(async () => {
+    await rimraf(distDir);
+  });
+
+  afterAll(async () => {
+    await rimraf(distDir);
+  });
+
+  // Listing every stylesheet under `sources` is not enough on its own: a
+  // sourcemap can name all of them and still resolve every position to the
+  // first one. These assertions pin the mappings themselves.
+  it('should resolve positions back to the stylesheet each rule came from', async () => {
+    await build({
+      root: playgroundDir,
+      build: { outDir: 'dist' },
+      configFile: false,
+      logLevel: 'error',
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+    const cssFile = files.find((file) => file.endsWith('.css'))!;
+    const css = await readFile(resolve(assetsDir, cssFile), 'utf-8');
+    const map = JSON.parse(
+      await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+    );
+
+    const tracer = new TraceMap(map);
+    const lines = css.split('\n');
+
+    const expectations: [string, string][] = [
+      ['btn', 'components/button.css'],
+      ['card', 'components/card.css'],
+      ['form', 'components/form.css'],
+      ['modal', 'components/modal.css'],
+      ['fade', 'animations.css'],
+    ];
+
+    for (const [selector, expectedSource] of expectations) {
+      const line = lines.findIndex(
+        (text) => text.includes(selector) && text.includes('{'),
+      );
+      expect(
+        line,
+        `no rule containing "${selector}" in the built CSS`,
+      ).toBeGreaterThan(-1);
+
+      const position = originalPositionFor(tracer, {
+        line: line + 1,
+        column: lines[line]!.indexOf(selector),
+      });
+
+      expect(
+        position.source,
+        `"${selector}" resolved to the wrong stylesheet`,
+      ).toContain(expectedSource);
+    }
+  });
+
+  it('should spread mappings across every stylesheet rather than collapsing onto one', async () => {
+    await build({
+      root: playgroundDir,
+      build: { outDir: 'dist' },
+      configFile: false,
+      logLevel: 'error',
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+    const cssFile = files.find((file) => file.endsWith('.css'))!;
+    const css = await readFile(resolve(assetsDir, cssFile), 'utf-8');
+    const map = JSON.parse(
+      await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+    );
+
+    const tracer = new TraceMap(map);
+    const resolved = new Set<string>();
+
+    for (let line = 1; line <= css.split('\n').length; line++) {
+      const { source } = originalPositionFor(tracer, { line, column: 0 });
+      if (source) resolved.add(source);
+    }
+
+    expect(resolved.size).toBeGreaterThan(1);
+    expect(resolved.size).toBe(map.sources.length);
   });
 });

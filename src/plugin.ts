@@ -1,15 +1,10 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import type { Plugin } from 'vite';
-import mergeSourceMap from 'merge-source-map';
+import { decode, encode } from '@jridgewell/sourcemap-codec';
 import type {
   NormalizedOutputOptions,
   OutputBundle,
-  PluginContext,
-  PreRenderedAsset,
-  RenderedChunk,
-  InputOption,
-  OutputOptions,
   ExistingRawSourceMap,
 } from 'rollup';
 import { EXTENSIONS, PLUGIN_NAME } from './constants';
@@ -18,8 +13,9 @@ import { hasValidExtension } from './utils';
 /**
  * Checks if a sourcemap is empty (has no meaningful mappings or sources)
  */
-function isEmptySourcemap(map: ExistingRawSourceMap): boolean {
+function isEmptySourcemap(map: ExistingRawSourceMap | null): boolean {
   return (
+    !map ||
     !map.mappings ||
     map.mappings === '' ||
     !map.sources ||
@@ -27,68 +23,51 @@ function isEmptySourcemap(map: ExistingRawSourceMap): boolean {
   );
 }
 
-/**
- * Generates an identity sourcemap for a source file.
- * This maps each line to itself in the original file.
- */
-function generateIdentitySourcemap(
-  code: string,
-  filename: string,
-): ExistingRawSourceMap {
-  const lines = code.split('\n');
-  // VLQ encoding for identity map: each line maps to the same line in source
-  // AAAA = column 0, source 0, source line 0, source column 0
-  // For subsequent lines, we only need to indicate "next line, same column offset"
-  // AACA = column 0, source 0, source line +1, source column 0
-  const mappings = lines.map((_, i) => (i === 0 ? 'AAAA' : 'AACA')).join(';');
-
-  return {
-    version: 3,
-    file: path.basename(filename),
-    sources: [filename],
-    sourcesContent: [code],
-    names: [],
-    mappings,
-  };
-}
-
 export interface CssSourcemapOptions {
   extensions?: string[];
   enabled?: boolean;
   folder?: string;
   getURL?: (fileName: string) => string;
+  /**
+   * Disable CSS minification while the plugin is active.
+   *
+   * Vite minifies a CSS asset after this plugin has recorded where each
+   * stylesheet landed inside it, which invalidates every offset. Leaving
+   * minification on therefore produces a sourcemap that resolves every
+   * position to the first source.
+   *
+   * @default true
+   */
+  disableCssMinify?: boolean;
 }
 
-function extractFileName(input: InputOption) {
-  if (typeof input === 'string') {
-    return path.parse(input).name;
-  }
-
-  if (Array.isArray(input) && input[0]) {
-    return path.parse(input[0]).name;
-  }
-
-  return path.parse(Object.keys(input)[0]!).name;
+/**
+ * A concatenated sourcemap. Declared locally rather than reusing Rollup's
+ * `ExistingRawSourceMap` because the spec allows a null entry in
+ * `sourcesContent` for a source whose text is unavailable, which that type
+ * does not model.
+ */
+interface ConcatenatedSourceMap {
+  version: 3;
+  file: string;
+  sources: string[];
+  sourcesContent: (string | null)[];
+  names: string[];
+  mappings: string;
 }
 
-function extractFullPath(outputOptions: OutputOptions, fileName: string) {
-  let fullPath = fileName;
+/** A stylesheet as it appeared once Vite finished compiling it. */
+interface CompiledStylesheet {
+  code: string;
+  map: ExistingRawSourceMap | null;
+}
 
-  if (outputOptions && outputOptions.assetFileNames) {
-    let assetDir: string | null = null;
-
-    if (typeof outputOptions.assetFileNames === 'string') {
-      assetDir = path.dirname(outputOptions.assetFileNames);
-    } else if (typeof outputOptions.assetFileNames === 'function') {
-      // TODO: Implement this
-    }
-
-    if (assetDir && assetDir !== '.') {
-      fullPath = path.join(assetDir, fileName);
-    }
-  }
-
-  return fullPath;
+/** Where a compiled stylesheet ended up inside the concatenated CSS asset. */
+interface PlacedStylesheet {
+  id: string;
+  stylesheet: CompiledStylesheet;
+  line: number;
+  column: number;
 }
 
 export default function cssSourcemapPlugin(
@@ -99,6 +78,7 @@ export default function cssSourcemapPlugin(
     enabled = true,
     folder = '',
     getURL = (fileName: string) => fileName,
+    disableCssMinify = true,
   } = options;
 
   if (!enabled) {
@@ -108,11 +88,7 @@ export default function cssSourcemapPlugin(
     };
   }
 
-  const assetToId = new Map<string, string[]>();
-  const idToMap = new Map<string, string>();
-  let templateName: string;
-  let outputOptions: OutputOptions | null = null;
-  let willAugmentChunkHash = true;
+  const compiled = new Map<string, CompiledStylesheet>();
   let sassCompiler: any = null;
 
   /**
@@ -158,9 +134,9 @@ export default function cssSourcemapPlugin(
       if (result.sourceMap) {
         return result.sourceMap as ExistingRawSourceMap;
       }
-    } catch (e) {
+    } catch {
       // Sass compilation failed (syntax error, file not found, etc.)
-      // Will fall back to identity sourcemap
+      // Will fall back to an identity mapping.
     }
     return null;
   }
@@ -169,177 +145,204 @@ export default function cssSourcemapPlugin(
     name: PLUGIN_NAME,
     apply: 'build',
 
-    buildStart(options) {
-      const viteCSSPlugin = options.plugins.find(
-        (plugin) => plugin.name === 'vite:css-post',
-      );
-
-      if (!viteCSSPlugin) {
-        throw new Error('vite:css-post plugin not found.');
-      }
-
-      templateName = extractFileName(options.input);
-
-      const augmentChunkHashHandler = {
-        apply: function (
-          target: (this: PluginContext, chunk: RenderedChunk) => string | void,
-          thisArg: PluginContext,
-          argumentsList: any[],
-        ) {
-          const [chunk] = argumentsList;
-          const result = Reflect.apply(target, thisArg, argumentsList);
-
-          if (!result) {
-            return result;
-          }
-
-          for (const id of chunk.moduleIds) {
-            if (hasValidExtension(id, extensions)) {
-              if (assetToId.has(result)) {
-                assetToId.get(result)?.push(id);
-              } else {
-                assetToId.set(result, [id]);
-              }
-            }
-          }
-
-          return result;
-        },
-      };
-
-      const currentMethod = viteCSSPlugin['augmentChunkHash']!;
-      const augmentChunkHashProxy = new Proxy(
-        currentMethod,
-        augmentChunkHashHandler,
-      );
-
-      Object.defineProperty(viteCSSPlugin, 'augmentChunkHash', {
-        value: augmentChunkHashProxy,
-      });
+    config() {
+      if (!disableCssMinify) return;
+      return { build: { cssMinify: false as const } };
     },
 
-    outputOptions(options: OutputOptions) {
-      outputOptions = options;
-
-      if (typeof options.entryFileNames === 'string') {
-        willAugmentChunkHash = options.entryFileNames.includes('[hash]');
-      } else if (typeof options.entryFileNames === 'function') {
-        // TODO: Implement this
-      }
-
-      return options;
-    },
-
-    async renderChunk(_: string, chunk: RenderedChunk) {
-      if (willAugmentChunkHash) return null;
-
-      for (const id of chunk.moduleIds) {
-        if (hasValidExtension(id, extensions)) {
-          // Use the chunk name to derive the asset path, not templateName
-          // This fixes the issue where SCSS entrypoints have different names
-          const fullPath = extractFullPath(outputOptions!, chunk.name);
-
-          if (assetToId.has(fullPath)) {
-            assetToId.get(fullPath)?.push(id);
-          } else {
-            assetToId.set(fullPath, [id]);
-          }
-        }
-      }
-
-      return null;
-    },
-
+    // Left at the default order so that this runs after `vite:css` has
+    // compiled a stylesheet, but before `vite:css-post` replaces it with a
+    // JavaScript module.
     async transform(code, id) {
-      if (hasValidExtension(id, extensions)) {
-        const fileName = path.parse(id).name.replace('.module', '');
-        let sourcemap = this.getCombinedSourcemap() as ExistingRawSourceMap;
+      if (!hasValidExtension(id, extensions)) return null;
+      if (!code.trim()) return null;
 
-        // If the combined sourcemap is empty (no prior transforms generated one),
-        // try to compile SCSS ourselves to get the sourcemap with all partials
-        if (isEmptySourcemap(sourcemap)) {
-          if (id.endsWith('.scss') || id.endsWith('.sass')) {
-            // For SCSS/Sass files, compile to get proper sourcemap with all @imported partials
-            const scssSourcemap = await compileSCSS(id);
-            if (scssSourcemap && !isEmptySourcemap(scssSourcemap)) {
-              sourcemap = scssSourcemap;
-            } else {
-              sourcemap = generateIdentitySourcemap(code, id);
-            }
-          } else {
-            // For plain CSS, generate an identity sourcemap
-            sourcemap = generateIdentitySourcemap(code, id);
-          }
-        }
+      let map = this.getCombinedSourcemap() as ExistingRawSourceMap | null;
 
-        const referenceIdMap = this.emitFile({
-          type: 'asset',
-          name: `${fileName}.map`,
-          source: JSON.stringify(sourcemap),
-        });
-
-        idToMap.set(id, referenceIdMap);
-
-        return {
-          code: code,
-          map: sourcemap,
-        };
+      if (
+        isEmptySourcemap(map) &&
+        (id.endsWith('.scss') || id.endsWith('.sass'))
+      ) {
+        // Compile the file ourselves so that @use/@import partials are
+        // represented, which the combined sourcemap does not cover when SCSS
+        // is a direct rollup entrypoint.
+        map = await compileSCSS(id);
       }
+
+      compiled.set(id, {
+        code,
+        map: isEmptySourcemap(map) ? null : map,
+      });
 
       return null;
     },
 
-    async generateBundle(_: NormalizedOutputOptions, bundle: OutputBundle) {
-      const fullPath = extractFullPath(outputOptions!, templateName);
+    generateBundle: {
+      // `vite:css-post` adds the CSS asset to the bundle from its own
+      // generateBundle, so this has to run after it.
+      order: 'post',
+      handler(_options: NormalizedOutputOptions, bundle: OutputBundle) {
+        for (const [fileName, asset] of Object.entries(bundle)) {
+          if (asset.type !== 'asset' || !fileName.endsWith('.css')) continue;
 
-      for (const [fileName, asset] of Object.entries(bundle)) {
-        if (asset.type === 'asset' && fileName.endsWith('.css')) {
-          // Try multiple key formats to find the source file IDs
-          // This handles both hashed asset names and non-hashed chunk names
-          const fileNameWithoutExt = fileName.replace(/\.css$/, '');
-          const sourceFileIds =
-            assetToId.get(fileName) ||
-            assetToId.get(fileNameWithoutExt) ||
-            assetToId.get(fullPath) ||
-            [];
-          const newMapFileName = `${asset.fileName}.map`;
+          const css = String(asset.source);
+          const placed = locateStylesheets(css, compiled);
 
-          const finalSourceMap = sourceFileIds.reduce(
-            (mergedMap: string | object | null, refId: string) => {
-              const mapReferenceId = idToMap.get(refId);
-              if (!mapReferenceId) return mergedMap;
-
-              const mapFileName = this.getFileName(mapReferenceId);
-              const generatedMap = (bundle[mapFileName] as PreRenderedAsset)
-                ?.source;
-
-              delete bundle[mapFileName];
-
-              return mergeSourceMap(mergedMap, generatedMap);
-            },
-            null,
-          );
-
-          if (!finalSourceMap) {
-            console.warn(`No source map found for ${fileName}`);
+          if (placed.length === 0) {
+            this.warn(
+              `No compiled stylesheet could be located inside ${fileName}, so no ` +
+                `sourcemap was emitted. This usually means the asset was minified ` +
+                `or rewritten after the plugin recorded it.`,
+            );
             continue;
           }
 
-          const mapReferencePath = path.basename(newMapFileName);
-          const outputPath = path.dirname(newMapFileName);
+          const map = buildConcatenatedSourcemap(placed, fileName);
+          const mapFileName = `${asset.fileName}.map`;
+          const mapBaseName = path.basename(mapFileName);
 
           this.emitFile({
             type: 'asset',
-            fileName: path.join(outputPath, folder, mapReferencePath),
-            source:
-              typeof finalSourceMap === 'string'
-                ? finalSourceMap
-                : JSON.stringify(finalSourceMap),
+            fileName: path.join(path.dirname(mapFileName), folder, mapBaseName),
+            source: JSON.stringify(map),
           });
 
-          asset.source += `\n/*# sourceMappingURL=${getURL(mapReferencePath)} */`;
+          asset.source = `${css}\n/*# sourceMappingURL=${getURL(mapBaseName)} */`;
         }
-      }
+      },
     },
   };
+}
+
+/**
+ * Finds where each compiled stylesheet was placed inside the concatenated CSS
+ * asset. Anything that cannot be found is skipped, which keeps a stylesheet
+ * that some other plugin rewrote from corrupting its neighbours' offsets.
+ */
+function locateStylesheets(
+  css: string,
+  compiled: Map<string, CompiledStylesheet>,
+): PlacedStylesheet[] {
+  const placed: PlacedStylesheet[] = [];
+
+  for (const [id, stylesheet] of compiled) {
+    const offset = css.indexOf(stylesheet.code.trim());
+    if (offset === -1) continue;
+
+    const preceding = css.slice(0, offset);
+    placed.push({
+      id,
+      stylesheet,
+      line: preceding.split('\n').length - 1,
+      // Vite can concatenate one stylesheet's last line and the next
+      // stylesheet's first onto a single physical line, so the offset within
+      // that line is what keeps their mappings apart.
+      column: offset - (preceding.lastIndexOf('\n') + 1),
+    });
+  }
+
+  return placed.sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+/**
+ * Builds a single sourcemap for a concatenated CSS asset by shifting each
+ * stylesheet's own mappings into the position it occupies in the asset.
+ *
+ * Concatenation places stylesheets side by side, so the individual maps cannot
+ * be composed the way a chain of transforms would be; each one has to be
+ * translated into the asset's coordinate space instead.
+ */
+function buildConcatenatedSourcemap(
+  placed: PlacedStylesheet[],
+  fileName: string,
+): ConcatenatedSourceMap {
+  const sources: string[] = [];
+  const sourcesContent: (string | null)[] = [];
+
+  const sourceIndex = (source: string, content: string | null): number => {
+    const existing = sources.indexOf(source);
+    if (existing !== -1) return existing;
+    sources.push(source);
+    sourcesContent.push(content);
+    return sources.length - 1;
+  };
+
+  const lines: [number, number, number, number][][] = [];
+  const addSegment = (
+    line: number,
+    segment: [number, number, number, number],
+  ) => {
+    while (lines.length <= line) lines.push([]);
+    lines[line]!.push(segment);
+  };
+
+  for (const { id, stylesheet, line, column } of placed) {
+    // A stylesheet owns exactly the lines its compiled CSS occupies. Segments
+    // past that would land inside the next stylesheet and win its lookups.
+    const span = stylesheet.code.trim().split('\n').length;
+    // Only the first line is offset horizontally; later lines start at column 0.
+    const shift = (index: number, col: number) =>
+      index === 0 ? column + col : col;
+    const decoded = stylesheet.map ? decode(stylesheet.map.mappings) : null;
+
+    if (decoded?.some((segments) => segments.length > 0)) {
+      const remapped = stylesheet.map!.sources.map((source, index) =>
+        sourceIndex(
+          resolveSource(id, source),
+          stylesheet.map!.sourcesContent?.[index] ?? null,
+        ),
+      );
+
+      decoded.slice(0, span).forEach((segments, index) => {
+        for (const segment of segments) {
+          if (segment.length < 4) continue;
+          addSegment(line + index, [
+            shift(index, segment[0]),
+            remapped[segment[1]!] ?? 0,
+            segment[2]!,
+            segment[3]!,
+          ]);
+        }
+      });
+    } else {
+      // Without a map the compiled CSS is line-for-line with its source, except
+      // where a plugin generated CSS the source never spelled out. Clamping
+      // keeps those lines attributed to the file that produced them rather than
+      // pointing past its end.
+      const index = sourceIndex(id, stylesheet.code);
+      const lastLine = Math.max(0, countLines(id) - 1);
+      for (let i = 0; i < span; i++) {
+        addSegment(line + i, [shift(i, 0), index, Math.min(i, lastLine), 0]);
+      }
+    }
+  }
+
+  return {
+    version: 3,
+    file: path.basename(fileName),
+    sources,
+    sourcesContent,
+    names: [],
+    mappings: encode(
+      lines.map((segments) => segments.sort((a, b) => a[0] - b[0])),
+    ),
+  };
+}
+
+function resolveSource(id: string, source: string): string {
+  if (path.isAbsolute(source)) return source;
+  try {
+    if (source.startsWith('file://')) return new URL(source).pathname;
+  } catch {
+    // Not a URL; treat it as a relative path below.
+  }
+  return path.resolve(path.dirname(id), source);
+}
+
+function countLines(file: string): number {
+  try {
+    return fs.readFileSync(file, 'utf-8').split('\n').length;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
 }
