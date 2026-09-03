@@ -79,8 +79,12 @@ interface AssetRegion {
   end: number;
 }
 
-/** Stand-in Vite leaves in CSS for an asset whose final URL isn't known yet. */
-const ASSET_PLACEHOLDER = /__VITE(?:_PUBLIC)?_ASSET__[\w$]+__/g;
+/**
+ * Stand-in Vite leaves in CSS for an asset whose final URL isn't known yet. A
+ * reference that carries a query or a fragment, such as `url("sprite.svg#id")`,
+ * puts it in the trailing `$_…__` group.
+ */
+const ASSET_PLACEHOLDER = /__VITE(?:_PUBLIC)?_ASSET__[\w$]+__(?:\$_.*?__)?/g;
 
 export default function cssSourcemapPlugin(
   options: CssSourcemapOptions = {},

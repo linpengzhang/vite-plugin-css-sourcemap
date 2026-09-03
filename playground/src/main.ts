@@ -23,6 +23,7 @@ import './styles/print.css';
 
 // Styles that reference an emitted asset
 import './styles/hero.css';
+import './styles/sprite.css';
 
 // Original styles
 import './styles/main.css';

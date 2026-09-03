@@ -540,9 +540,15 @@ describe('vite-plugin-css-sourcemap position resolution', () => {
 
     expect(css).toContain('url(');
     expect(css).not.toContain('__VITE_ASSET__');
-    expect(
-      map.sources.some((source: string) => source.includes('hero.css')),
-    ).toBe(true);
+
+    // A bare reference and one carrying a fragment use different shapes of
+    // placeholder, so both have to survive the rewrite.
+    for (const stylesheet of ['hero.css', 'sprite.css']) {
+      expect(
+        map.sources.some((source: string) => source.includes(stylesheet)),
+        `${stylesheet} is missing from the sourcemap`,
+      ).toBe(true);
+    }
 
     const tracer = new TraceMap(map);
     const lines = css.split('\n');

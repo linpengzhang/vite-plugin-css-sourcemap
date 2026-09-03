@@ -1,0 +1,11 @@
+/* A reference carrying a fragment is held in a different shape of Vite
+   placeholder than a bare one. */
+.sprite {
+  background-image: url('../assets/sprite.svg#star');
+  width: 1rem;
+  height: 1rem;
+}
+
+.sprite-label {
+  font-weight: 700;
+}
