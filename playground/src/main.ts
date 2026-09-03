@@ -21,6 +21,9 @@ import './styles/animations.css';
 import './styles/a11y.css';
 import './styles/print.css';
 
+// Styles whose leading at-rule is hoisted to the top of the asset
+import './styles/fonts.css';
+
 // Styles that reference an emitted asset
 import './styles/hero.css';
 import './styles/sprite.css';

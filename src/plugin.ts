@@ -71,6 +71,10 @@ interface PlacedStylesheet {
   stylesheet: CompiledStylesheet;
   line: number;
   column: number;
+  /** Leading compiled lines that were hoisted away from the rest. */
+  skippedLines: number;
+  /** How many lines of the asset the stylesheet accounts for. */
+  span: number;
 }
 
 /** A region of the concatenated asset that one stylesheet occupies. */
@@ -202,11 +206,19 @@ export default function cssSourcemapPlugin(
       // generateBundle, so this has to run after it.
       order: 'post',
       handler(_options: NormalizedOutputOptions, bundle: OutputBundle) {
+        const stylesheetsByAsset = groupStylesheetsByAsset(bundle, compiled);
+
         for (const [fileName, asset] of Object.entries(bundle)) {
           if (asset.type !== 'asset' || !fileName.endsWith('.css')) continue;
 
           const css = String(asset.source);
-          const placed = locateStylesheets(css, compiled);
+          // Restricted to the stylesheets this asset was built from. Searching
+          // all of them would let a stylesheet in one chunk claim the region of
+          // an identical one in another, and the loser's coverage with it.
+          const placed = locateStylesheets(
+            css,
+            stylesheetsByAsset.get(fileName) ?? compiled,
+          );
 
           if (placed.length === 0) {
             this.warn(
@@ -253,11 +265,11 @@ function locateStylesheets(
   );
 
   for (const [, stylesheet] of byLengthDescending) {
-    const region = findUnclaimedRegion(css, stylesheet.code.trim(), claimed);
-    if (!region) continue;
-    claimed.push(region);
+    const body = locateBody(css, stylesheet.code.trim(), claimed);
+    if (!body) continue;
+    claimed.push(body.region);
 
-    const preceding = css.slice(0, region.start);
+    const preceding = css.slice(0, body.region.start);
     placed.push({
       id: stylesheet.sourcePath,
       stylesheet,
@@ -265,11 +277,99 @@ function locateStylesheets(
       // Vite can concatenate one stylesheet's last line and the next
       // stylesheet's first onto a single physical line, so the offset within
       // that line is what keeps their mappings apart.
-      column: region.start - (preceding.lastIndexOf('\n') + 1),
+      column: body.region.start - (preceding.lastIndexOf('\n') + 1),
+      skippedLines: body.skippedLines,
+      span: body.text.split('\n').length,
     });
   }
 
   return placed.sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+/**
+ * Works out which stylesheets each CSS asset was built from, by way of the
+ * chunk that pulled the asset in. Assets with no chunk claiming them are left
+ * out, and fall back to being searched against every stylesheet.
+ */
+function groupStylesheetsByAsset(
+  bundle: OutputBundle,
+  compiled: Map<string, CompiledStylesheet>,
+): Map<string, Map<string, CompiledStylesheet>> {
+  const byAsset = new Map<string, Map<string, CompiledStylesheet>>();
+
+  for (const output of Object.values(bundle)) {
+    if (output.type !== 'chunk') continue;
+
+    const importedCss = output.viteMetadata?.importedCss;
+    if (!importedCss) continue;
+
+    for (const assetFileName of importedCss) {
+      let stylesheets = byAsset.get(assetFileName);
+      if (!stylesheets) {
+        stylesheets = new Map();
+        byAsset.set(assetFileName, stylesheets);
+      }
+      for (const id of output.moduleIds) {
+        const stylesheet = compiled.get(id);
+        if (stylesheet) stylesheets.set(id, stylesheet);
+      }
+    }
+  }
+
+  return byAsset;
+}
+
+/**
+ * Finds the part of a stylesheet that survives into the asset as one run of
+ * text, along with where it landed.
+ *
+ * Vite hoists `@charset` and `@import` to the top of the concatenated file, so
+ * a stylesheet opening with an external import — a webfont, most often — is
+ * split in two and its compiled text never appears contiguously. Retrying
+ * without those leading at-rules recovers the rest of the file, which is where
+ * all of its rules are anyway.
+ */
+function locateBody(
+  css: string,
+  code: string,
+  claimed: readonly AssetRegion[],
+): { region: AssetRegion; text: string; skippedLines: number } | null {
+  const whole = findUnclaimedRegion(css, code, claimed);
+  if (whole) return { region: whole, text: code, skippedLines: 0 };
+
+  const withoutAtRules = stripHoistedAtRules(code);
+  if (!withoutAtRules) return null;
+
+  const region = findUnclaimedRegion(css, withoutAtRules.text, claimed);
+  return region ? { region, ...withoutAtRules } : null;
+}
+
+/**
+ * Drops the `@charset` and `@import` statements a stylesheet opens with, or
+ * returns null when it has none. CSS only permits them at the top of a file, so
+ * they are always a prefix.
+ */
+function stripHoistedAtRules(
+  code: string,
+): { text: string; skippedLines: number } | null {
+  let rest = code;
+  let found = false;
+
+  for (;;) {
+    const match = /^\s*@(?:charset|import)\b[^;]*;/.exec(rest);
+    if (!match) break;
+    rest = rest.slice(match[0].length);
+    found = true;
+  }
+
+  if (!found) return null;
+
+  const text = rest.trimStart();
+  const consumed = code.length - text.length;
+  return {
+    text,
+    skippedLines: code.slice(0, consumed).split('\n').length - 1,
+  };
 }
 
 /**
@@ -376,10 +476,7 @@ function buildConcatenatedSourcemap(
     lines[line]!.push(segment);
   };
 
-  for (const { id, stylesheet, line, column } of placed) {
-    // A stylesheet owns exactly the lines its compiled CSS occupies. Segments
-    // past that would land inside the next stylesheet and win its lookups.
-    const span = stylesheet.code.trim().split('\n').length;
+  for (const { id, stylesheet, line, column, skippedLines, span } of placed) {
     // Only the first line is offset horizontally; later lines start at column 0.
     const shift = (index: number, col: number) =>
       index === 0 ? column + col : col;
@@ -393,17 +490,21 @@ function buildConcatenatedSourcemap(
         ),
       );
 
-      decoded.slice(0, span).forEach((segments, index) => {
-        for (const segment of segments) {
-          if (segment.length < 4) continue;
-          addSegment(line + index, [
-            shift(index, segment[0]),
-            remapped[segment[1]!] ?? 0,
-            segment[2]!,
-            segment[3]!,
-          ]);
-        }
-      });
+      // A stylesheet owns exactly the lines it occupies in the asset. Segments
+      // past that would land inside the next stylesheet and win its lookups.
+      decoded
+        .slice(skippedLines, skippedLines + span)
+        .forEach((segments, index) => {
+          for (const segment of segments) {
+            if (segment.length < 4) continue;
+            addSegment(line + index, [
+              shift(index, segment[0]),
+              remapped[segment[1]!] ?? 0,
+              segment[2]!,
+              segment[3]!,
+            ]);
+          }
+        });
     } else {
       // Without a map the compiled CSS is line-for-line with its source, except
       // where a plugin generated CSS the source never spelled out. Clamping
@@ -412,7 +513,12 @@ function buildConcatenatedSourcemap(
       const index = sourceIndex(id, stylesheet.code);
       const lastLine = Math.max(0, countLines(id) - 1);
       for (let i = 0; i < span; i++) {
-        addSegment(line + i, [shift(i, 0), index, Math.min(i, lastLine), 0]);
+        addSegment(line + i, [
+          shift(i, 0),
+          index,
+          Math.min(i + skippedLines, lastLine),
+          0,
+        ]);
       }
     }
   }

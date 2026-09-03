@@ -563,6 +563,45 @@ describe('vite-plugin-css-sourcemap position resolution', () => {
     ).toContain('hero.css');
   });
 
+  // Vite lifts `@import` and `@charset` to the top of the concatenated file, so
+  // a stylesheet opening with one is split in two and its compiled text never
+  // appears as a single run.
+  it('should map a stylesheet whose leading at-rule is hoisted', async () => {
+    await build({
+      root: playgroundDir,
+      build: { outDir: 'dist' },
+      configFile: false,
+      logLevel: 'error',
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+    const cssFile = files.find((file) => file.endsWith('.css'))!;
+    const css = await readFile(resolve(assetsDir, cssFile), 'utf-8');
+    const map = JSON.parse(
+      await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+    );
+
+    const lines = css.split('\n');
+    expect(lines[0]).toContain('@import');
+    expect(
+      map.sources.some((source: string) => source.includes('fonts.css')),
+      'fonts.css is missing from the sourcemap',
+    ).toBe(true);
+
+    // The rules must keep pointing at their original lines even though the
+    // at-rule above them was moved elsewhere.
+    const line = lines.findIndex((text) => text.includes('.font-heading'));
+    expect(line, 'no .font-heading rule in the built CSS').toBeGreaterThan(-1);
+
+    const position = originalPositionFor(new TraceMap(map), {
+      line: line + 1,
+      column: lines[line]!.indexOf('.font-heading'),
+    });
+    expect(position.source).toContain('fonts.css');
+    expect(position.line).toBe(7);
+  });
+
   // Claiming a start offset rather than a whole region lets a stylesheet whose
   // CSS is contained in another's take a position inside it, so the containing
   // stylesheet either goes missing or inherits the shorter one's coverage.
@@ -604,5 +643,71 @@ describe('vite-plugin-css-sourcemap position resolution', () => {
         column: lines[line]!.indexOf('.skip-link'),
       }).source,
     ).toContain('a11y.css');
+  });
+});
+
+// With `cssCodeSplit` each entry gets its own CSS asset. Searching every
+// captured stylesheet inside every asset lets one entry's stylesheet claim the
+// identical region in the other entry's asset, leaving its twin unmapped and
+// its coverage attributed to the wrong file.
+describe('vite-plugin-css-sourcemap split assets', () => {
+  const playgroundDir = resolve(__dirname, '../playground');
+  const distDir = resolve(playgroundDir, 'dist-split');
+  const assetsDir = resolve(distDir, 'assets');
+
+  beforeEach(async () => {
+    await rimraf(distDir);
+  });
+
+  afterAll(async () => {
+    await rimraf(distDir);
+  });
+
+  it('should attribute identical stylesheets to their own file', async () => {
+    await build({
+      root: playgroundDir,
+      configFile: false,
+      logLevel: 'error',
+      build: {
+        outDir: 'dist-split',
+        cssCodeSplit: true,
+        rollupOptions: {
+          input: {
+            a: resolve(playgroundDir, 'src/split/entry-a.ts'),
+            b: resolve(playgroundDir, 'src/split/entry-b.ts'),
+          },
+        },
+      },
+      plugins: [(await import('./index')).default()],
+    });
+
+    const files = await readdir(assetsDir);
+
+    for (const [entry, expected] of [
+      ['a-', 'split/alpha.css'],
+      ['b-', 'split/beta.css'],
+    ]) {
+      const cssFile = files.find(
+        (file) => file.startsWith(entry!) && file.endsWith('.css'),
+      );
+      expect(cssFile, `no CSS asset for entry ${entry}`).toBeDefined();
+
+      const css = await readFile(resolve(assetsDir, cssFile!), 'utf-8');
+      const map = JSON.parse(
+        await readFile(resolve(assetsDir, `${cssFile}.map`), 'utf-8'),
+      );
+
+      const lines = css.split('\n');
+      const line = lines.findIndex((text) => text.includes('.shared-widget'));
+      expect(line, 'no .shared-widget rule in the built CSS').toBeGreaterThan(
+        -1,
+      );
+
+      const position = originalPositionFor(new TraceMap(map), {
+        line: line + 1,
+        column: 0,
+      });
+      expect(position.source).toContain(expected!);
+    }
   });
 });

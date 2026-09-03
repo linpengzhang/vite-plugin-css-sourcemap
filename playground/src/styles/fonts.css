@@ -1,0 +1,9 @@
+@import url('https://fonts.example/css2?family=Inter');
+
+.font-body {
+  font-family: Inter, sans-serif;
+}
+
+.font-heading {
+  font-weight: 800;
+}
